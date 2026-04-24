@@ -41,6 +41,13 @@
 #define COL_THRESH 7
 #define COL_REMOTE 12
 
+// TIMER1 prescaler and watchdog
+// using prescaler 8: timer ticks at 16MHz/8 = 2MHz (0.5us per tick)
+// sensor max range = 400cm, max echo = ~23.2ms -> max ticks = 46400 (fits in 16-bit)
+// watchdog: if TCNT1 reaches this value something went wrong, abort measurement
+#define T1_PRESCALER_BITS ((1 << CS11)) // prescaler = 8
+#define T1_WATCHDOG 50000               // ~25ms at 2MHz, safely above max echo
+
 // encoder
 volatile uint8_t enc_old_state;
 volatile uint8_t enc_changed; // set to 1 by ISR; cleared by main loop
@@ -52,8 +59,18 @@ volatile uint8_t threshold; // cm/sec, always clamped to 1-99
 volatile int16_t speed_mm_sec; // signed mm/sec
 volatile uint8_t speed_valid;  // 0 = no measurement yet / failed
 
+// rangefinder state
+// range values stored in mm for precision (displayed as cm with 1 decimal)
+volatile uint8_t echo_state;   // 0 = waiting for rising edge, 1 = waiting for falling
+volatile uint16_t range1_mm;   // first range measurement in mm
+volatile uint8_t range1_valid; // 1 = range1 has a good reading
+volatile uint8_t meas_done;    // set by ISR when measurement completes or fails
+
 // prototypes
+void timer1_init_pulse(void);
 void timer2_init(void);
+void trigger_sensor(void);
+void show_range1(void);
 void led_off_all(void);
 void led_blue(void);
 void led_green(void);
@@ -108,6 +125,39 @@ void show_threshold(void)
     snprintf(buf, 4, "%2d", (int)threshold);
     lcd_moveto(1, COL_THRESH);
     lcd_stringout(buf);
+}
+
+// display range1 in cm with one decimal at upper-left of LCD
+// range is stored in mm, e.g. 276mm -> "27.6" at row 0 col 0
+void show_range1(void)
+{
+    char buf[7];
+    uint16_t cm_int = range1_mm / 10;  // integer part of cm
+    uint16_t cm_frac = range1_mm % 10; // fractional digit
+    snprintf(buf, 7, "%3u.%1u", cm_int, cm_frac);
+    lcd_moveto(0, COL_R1);
+    lcd_stringout(buf);
+}
+
+// init TIMER1 for free-running pulse-width measurement
+// does NOT start the timer - timer starts in the echo ISR on rising edge
+void timer1_init_pulse(void)
+{
+    TCCR1A = 0; // normal mode (no output compare pins)
+    TCCR1B = 0; // timer stopped for now
+    TCNT1 = 0;
+
+    // watchdog: interrupt if count reaches T1_WATCHDOG (runaway echo)
+    OCR1A = T1_WATCHDOG;
+    TIMSK1 |= (1 << OCIE1A); // enable compare-A interrupt
+}
+
+// send a 10us trigger pulse to the rangefinder to start a measurement
+void trigger_sensor(void)
+{
+    PORTD |= (1 << PD3); // trigger high
+    _delay_us(10);
+    PORTD &= ~(1 << PD3); // trigger low
 }
 
 // TIMER2 - fast pwm for servo dial indidcator (OC2A = PB3), prescalar 1024 -> period = 16.4ms
@@ -195,6 +245,49 @@ ISR(PCINT1_vect)
     }
 }
 
+// echo pin ISR - PCINT2 = port d (pin change interrupt on PD2)
+// rising edge: start TIMER1 free-running
+// falling edge: stop TIMER1, convert count to mm, signal done
+ISR(PCINT2_vect)
+{
+    if (PIND & (1 << PD2))
+    {
+        // rising edge - start of echo pulse, reset and start TIMER1
+        TCNT1 = 0;
+        TCCR1B = T1_PRESCALER_BITS; // start timer, normal mode
+        echo_state = 1;
+    }
+    else
+    {
+        // falling edge - end of echo pulse
+        if (echo_state == 1)
+        {
+            TCCR1B = 0; // stop timer
+            uint16_t count = TCNT1;
+
+            // convert count to mm
+            // at prescaler 8: each tick = 0.5us
+            // sound speed = 340 m/s = 0.034 cm/us = 0.34 mm/us
+            // distance = (count * 0.5us * 0.34 mm/us) / 2  (divide by 2 for round trip)
+            // = count * 0.5 * 0.34 / 2 = count * 0.085 mm
+            // avoid floats: distance_mm = count * 17 / 200
+            range1_mm = (uint32_t)count * 17 / 200;
+            range1_valid = 1;
+            meas_done = 1;
+            echo_state = 0;
+        }
+    }
+}
+
+// TIMER1 compare-A ISR - watchdog: echo pulse took too long, abort measurement
+ISR(TIMER1_COMPA_vect)
+{
+    TCCR1B = 0; // stop timer
+    echo_state = 0;
+    range1_valid = 0;
+    meas_done = 1; // signal main loop that measurement ended (failed)
+}
+
 // main
 int main(void)
 {
@@ -217,6 +310,7 @@ int main(void)
     lcd_init();
     adc_init();
     timer2_init();
+    timer1_init_pulse();
 
     // splash screen
     lcd_writecommand(1);
@@ -258,9 +352,13 @@ int main(void)
     else
         enc_old_state = 3;
 
-    // enable encoder pin-change interrupts (PC4 and PC5)
+    // enable encoder pin-change interrupts on PC4 and PC5
     PCICR |= (1 << PCIE1);
     PCMSK1 |= (1 << PCINT4) | (1 << PCINT5);
+
+    // enable echo pin-change interrupt on PD2
+    PCICR |= (1 << PCIE2);
+    PCMSK2 |= (1 << PCINT18);
 
     sei();
 
@@ -277,20 +375,46 @@ int main(void)
             update_led();
         }
 
-        // read LCD buttons (placeholder - rangefinder added in Phase 2)
+        // read LCD buttons
         uint8_t btn = adc_sample(0);
 
-        // LEFT button (≈156) = "Start" initiates first range measurement
+        // LEFT button (~156) = "Start" - trigger first range measurement
         if (btn > BTN_LEFT - BTN_TOL && btn < BTN_LEFT + BTN_TOL)
         {
-            // phase 2 will trigger the rangefinder here
+            // reset measurement state and fire the sensor
+            meas_done = 0;
+            range1_valid = 0;
+            echo_state = 0;
+            TCNT1 = 0;
+            trigger_sensor();
+
+            // wait for ISR to signal measurement done (with a timeout in case
+            // the echo interrupt never fires at all)
+            uint16_t timeout = 0;
+            while (!meas_done && timeout < 60000)
+            {
+                timeout++;
+                _delay_us(1);
+            }
+
+            // display result or clear the field on failure
+            if (range1_valid)
+            {
+                show_range1();
+            }
+            else
+            {
+                lcd_moveto(0, COL_R1);
+                lcd_stringout(" --- ");
+            }
+
             _delay_ms(200); // debounce
         }
 
-        // RIGHT button (≈0) = "Stop" – initiates second range measurement
+        // RIGHT button (~0) = "Stop" – second measurement added in Phase 3
         if (btn <= BTN_RIGHT + BTN_TOL)
         {
-            // phase 2 will trigger the rangefinder here
+            // phase 3 will trigger the second rangefinder measurement here
             _delay_ms(200); // debounce
         }
 

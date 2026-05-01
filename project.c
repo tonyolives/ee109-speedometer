@@ -338,15 +338,18 @@ ISR(PCINT2_vect)
     else
     {
         // falling edge - end of echo pulse
-        if (echo_state == 1)
+        if (echo_state == 1) // guard in case of PCINT firing for no reason (electrical noise ig)
         {
             TCCR1B = 0; // stop timer
             uint16_t count = TCNT1;
 
             // convert count to distance in mm
-            // prescaler 8 -> 2MHz -> 0.5us per tick
+            // prescaler 8 -> 16MHz/8 = 2MHz -> 0.5us per tick
+            // sound travels at 340 m/s = 340000 mm/s
             // distance_mm = count * 0.5us * 340000mm/s / 2 = count * 17 / 200
             uint16_t dist_mm = (uint32_t)count * 17 / 200;
+            // gotta cast, count can reach 47000... this * 17 = 799000 which is over 16 bit uint16_1 (max 65535)
+            // without cast multiplicatino overlflow so we evaluate in 32 bit artihmetic then put it back into uint16_t after the /200 since it fits
 
             if (state == STATE_MEASURING1)
             {
@@ -366,7 +369,7 @@ ISR(PCINT2_vect)
 }
 
 // TIMER1 compare-A ISR - two roles depending on state:
-// STATE_TIMING:    stopwatch tick (increment elapsed_tenths, check 10s timeout)
+// STATE_TIMING = stopwatch tick (increment elapsed_tenths, check 10s timeout)
 // all other states: watchdog (echo took too long, abort measurement)
 ISR(TIMER1_COMPA_vect)
 {
@@ -490,12 +493,11 @@ int main(void)
             lcd_stringout("    "); // clear elapsed time
         }
 
-        // update elapsed time display and servo dial while stopwatch is running
+        // update elapsed time display and (eventually) servo dial while stopwatch is running
         if (state == STATE_TIMING && time_changed)
         {
             time_changed = 0;
             show_elapsed();
-            // servo rotates from full-CCW (35) to full-CW (12) over 10 seconds
             // OCR2A = 35 - elapsed_tenths * 23 / 100
             OCR2A = (uint8_t)(35 - (uint16_t)elapsed_tenths * 23 / 100);
         }

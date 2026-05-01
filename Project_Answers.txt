@@ -15,6 +15,22 @@ the circuit board or wires. In a real environment we would manufacture a PCB
 (Printed Circuit Board). As an optional task, you can search online for PCB
 manufacturers and what the costs and options are in creating a PCB.
 
+[I am not using the some stuff in checkpoint one, but including them since they will be used in the project...]
+
+Arduino Uno - $27.60 / unit
+LCD Shield - $9.90 / unit
+Ultrasonic Rangefinder - $3.95 / unit
+Servo Motor - $5.95 / unit
+RGB LED - $0.09 / unit
+Rotary Encoder - $1.09 / unit
+Buzzer - $0.55 / unit
+Tri-State Buffer - $0.37 / unit
+240 ohm resistors (x2) - $0.04 / unit
+1.5k ohm resistor (x1) - $0.01 / unit
+---
+Total - $49.55 / unit
+
+
 
 Review Question 2 (Health/Safety/Reliability)
 
@@ -25,7 +41,20 @@ Considering reliability, health, and safety...
  - What scenarios might you suggest testing (considering both HW and SW) 
     before releasing the product for use? 
 
+Hardware:
 
+test the rangefinder at its limits (2cm and 400cm) to make sure readings don't overflow or produce garbage
+test with different surface materials like glass or foam since ultrasonic sensors can behave weirdly on some surfaces
+test the encoder at threshold = 1 and threshold = 99 to make sure clamping works and the display doesn't break
+power cycle the device a bunch of times to verify the EEPROM saves the threshold correctly
+disconnect the echo wire and confirm the system recovers without freezing
+
+Software:
+
+press START and do nothing for 10 seconds, make sure the system resets cleanly and the LED goes blue
+test with a very short elapsed time (1 tenth of a second) to make sure the speed calculation doesn't do anything weird
+test with equal range1 and range2 so speed = 0, verify green LED comes on
+set the threshold to exactly the measured speed and confirm green lights up, not red
 
 
  - How might you make your design more reliable? By reliability we don't just
@@ -36,7 +65,7 @@ Considering reliability, health, and safety...
    those cases.
 
 
-
-
-
-
+track consecutive rangefinder failures and show a persistent error on the LCD instead of just flashing dashes each time
+store the threshold at two EEPROM addresses and cross-check them on startup to catch any corruption
+16-bit shared variables like speed_mm_sec should be read with interrupts disabled to avoid reading a half-updated value mid-ISR
+a real deployment should use a PCB with soldered connections since breadboard connections can fail

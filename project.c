@@ -24,6 +24,10 @@
 #define BTN_SELECT 205
 #define BTN_TOL 20 // ±tolerance for all comparisons
 
+#define FOSC 16000000UL               // 16mhz arduino clock
+#define BAUD 9600                     // baud rate from project spec
+#define MYUBRR (FOSC / 16 / BAUD - 1) // compile-time computed: 103 for 9600
+
 // EEPROM one byte at address 0 stores the speed threshold across power cycles.
 #define EE_THRESH_ADDR ((uint8_t *)0x00)
 
@@ -77,6 +81,33 @@ volatile uint8_t elapsed_tenths;    // counts 0.1s ticks, max 100 (= 10.0s)
 volatile uint8_t time_changed;      // set by stopwatch ISR each tick
 volatile uint8_t stopwatch_timeout; // set by stopwatch ISR at 10.0s
 
+// remote serial receive - state for the @<digits>$ ===
+// keeping all of these volatile because the rx isr writes them and main reads them
+volatile char rx_buf[6];        // up to 5 chars (- and 4 digits) + null terminator
+volatile uint8_t rx_count;      // how many valid chars in rx_buf so far
+volatile uint8_t rx_started;    // 1 once '@' has been seen, 0 otherwise
+volatile uint8_t rx_valid;      // 1 once a complete '@...$' packet is in rx_buf
+volatile uint8_t remote_valid;  // we have ever received at least one valid speed
+volatile int16_t remote_mm_sec; // last received remote speed in mm/sec
+
+// buzzer state : the timer0 isr reads these to know what tone to play
+// each note has a "pitch" value (ocr) and a "duration" value (cnt = number of toggles)
+// these arrays hold the 3 notes of the current sequence; main loop fills them.
+
+// numbers below were computed once with these formulas, at 16mhz with prescaler 64:
+// ocr value for freq f hz  = 250000 / (2 * f) - 1
+// toggle count for 350 ms  = 350 * 2 * f / 1000
+
+// c5 = 523 hz = ocr 238 = 366 toggles
+// e5 = 659 hz = ocr 188 = 461 toggles
+// g5 = 784 hz = ocr 158 = 548 toggles
+
+// frequencies chosen because lab 6 used multiples of 50 hz (400-1600), so musical notes c5/e5/g5 are clearly different and form a c major triad and my music nerd firend is with me
+volatile uint8_t buzz_ocr[3];  // pitch (ocr0a) for each of the 3 notes
+volatile uint16_t buzz_cnt[3]; // toggle count for each note (controls duration)
+volatile uint8_t buzz_idx;     // which note we're currently on (0, 1, or 2)
+volatile uint16_t buzz_count;  // toggles remaining in current note
+
 // overall state
 volatile uint8_t state = STATE_IDLE;
 
@@ -96,6 +127,13 @@ void led_green(void);
 void led_red(void);
 void update_led(void);
 void show_threshold(void);
+void usart_init(void);
+void serial_putchar(char c);
+void send_speed(int16_t mm_sec);
+void show_remote_speed(int16_t mm_sec);
+void timer0_init(void);
+void play_ascending(void);
+void play_descending(void);
 
 // LED helper functions (to make my life easier leater) - pull cathode LOW to light, HIGH to turn off
 void led_off_all(void)
@@ -229,15 +267,129 @@ void timer1_start_stopwatch(void)
     TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC, prescaler 64, starts now
 }
 
-// TIMER2 - fast pwm for servo dial indidcator (OC2A = PB3), prescalar 1024 -> period = 16.4ms
-// OCR2A controls pulse width = 12 -> 0.75ms
-// OCR2A = 35 -> 2.25ms
+// TIMER2 - fast pwm for servo dial indidcator (OC2A = PB3)
+// prescalar 1024 -> one tick = 64 microsec, period = 256 ticks = 16.384ms
+// 0.75ms pulse -> right -> OCR2A = 12 (10 secs elapsed)
+// 2.25ms pulse -> left -> OCR2A = 35 (0 secs elapsed)
 void timer2_init(void)
 {
     TCCR2A |= (0b11 << WGM20);  // fast PWM, modulus = 256
-    TCCR2A |= (0b10 << COM2A0); // Clear OC2A at compare, set at BOTTOM
-    OCR2A = 12;                 // Start at full-CW (no time elapsed yet)
-    TCCR2B |= (0b111 << CS20);  // Prescaler = 1024
+    TCCR2A |= (0b10 << COM2A0); // clear OC2A at compare, set at BOTTOM
+    OCR2A = 35;                 // start at full left (no time elapsed yet)
+    TCCR2B |= (0b111 << CS20);  // prescaler = 1024 (longest poss period)
+}
+
+// configure timer0 in ctc mode for buzzer tone generation, but DO NOT star
+// the timer only runs while a tone is sounding (started by play_ascending / play_descending
+// stopped by the isr when the sequence finishes
+void timer0_init(void)
+{
+    TCCR0A = (1 << WGM01);   // ctc mode: timer counts 0..ocr0a then resets
+    TIMSK0 |= (1 << OCIE0A); // enable interrupt (fires the isr)
+    // tccr0b stays 0 -> prescaler bits clear -> timer is stopped until we set them
+}
+
+// kick off the ascending 3-note sequence: c5 -> e5 -> g5
+// played when |remote speed| > threshold (remote board is faster than our threshold)
+void play_ascending(void)
+{
+    TCCR0B = 0;           // stop any tone already in progress
+    PORTB &= ~(1 << PB5); // make sure buzzer pin starts low
+
+    // load the 3 notes from low to high pitch
+    buzz_ocr[0] = 238;
+    buzz_cnt[0] = 366; // c5 (low)
+    buzz_ocr[1] = 188;
+    buzz_cnt[1] = 461; // e5 (mid)
+    buzz_ocr[2] = 158;
+    buzz_cnt[2] = 548; // g5 (high)
+
+    // start the first note - isr will handle the rest in the background
+    buzz_idx = 0;
+    OCR0A = buzz_ocr[0];                // sets pitch
+    buzz_count = buzz_cnt[0];           // sets duration
+    TCNT0 = 0;                          // start counting from zero
+    TCCR0B = (1 << CS01) | (1 << CS00); // prescaler 64 jus starts timer0
+}
+
+// kick off the descending 3 note sequence: g5 -> e5 -> c5
+// played when |remote speed| <= threshold (remote is at or below our threshold)
+void play_descending(void)
+{
+    TCCR0B = 0;
+    PORTB &= ~(1 << PB5);
+
+    // load the 3 notes from high to low pitch
+    buzz_ocr[0] = 158;
+    buzz_cnt[0] = 548; // g5 (high)
+    buzz_ocr[1] = 188;
+    buzz_cnt[1] = 461; // e5 (mid)
+    buzz_ocr[2] = 238;
+    buzz_cnt[2] = 366; // c5 (low)
+
+    buzz_idx = 0;
+    OCR0A = buzz_ocr[0];
+    buzz_count = buzz_cnt[0];
+    TCNT0 = 0;
+    TCCR0B = (1 << CS01) | (1 << CS00);
+}
+
+// SEE SLIDES on serial interfaces for info on how to configure USART0 module with given settings
+// configure usart0 for 9600 baud rate, 8 data bits, no parity, 1 stop bit, async
+// also enables rx-complete interrupt so received bytes go through ISR(USART_RX_vect)
+void usart_init(void)
+{
+    // baud rate (103)
+    UBRR0 = MYUBRR;
+
+    // note here: we need baud rate bc we dont have a clock signal. so the receiver has to know when to sample the line, jus tby
+    // seeing start but it samples the line every 1/baud seconds to recover each bit
+
+    // ucsr0b: enable rx, tx, and rx-complete interrupt
+    // can check every time through main loop for character, but can get stuck waiting if half was sent. better solution is to
+    // use interrupts for the received data - receiver interrupts are enabled by setting the RXCIE0 bit to a one
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+
+    // ucsr0c: 8 data bits = ucsz01:00 = 11
+    // other bits default to zero -> async, no parity, 1 stop bit (8n1)
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+// transmit one character via usart - polling style from slides
+// blocks until the transmit data register is empty, then loads the byte
+// udre0 = 1 means "data register empty - safe to write next byte to udr0"
+void serial_putchar(char ch)
+{
+    while ((UCSR0A & (1 << UDRE0)) == 0)
+    {
+    } // wait for tx buffer to be free
+    UDR0 = ch; // writing udr0 kicks off transmission
+}
+
+// send the local speed as "@<value>$"
+// example: 17.4 cm/sec = "@174$"
+// snprintf %d handles the optional negative sign automatically
+void send_speed(int16_t mm_sec)
+{
+    char buf[8]; // worst case "@-9999$" + null = 8 bytes
+    snprintf(buf, 8, "@%d$", mm_sec);
+
+    // walk the string and send each byte. loop ends at null terminator
+    // which is NOT transmitted - it just marks end of our string.
+    for (uint8_t i = 0; buf[i] != '\0'; i++)
+        serial_putchar(buf[i]);
+}
+
+// display remote speed at lower-right of lcd in cm/sec (integer)
+// only 4 columns available (cols 12-15) so we show signed integer cm/sec
+// like " 12" or "-99". incoming value is in mm/sec, so /10 gives cm/sec.
+void show_remote_speed(int16_t mm_sec)
+{
+    char buf[8];                 // sized for worst case int16 plus null
+    int16_t cm = mm_sec / 10;    // integer cm/sec, sign preserved
+    snprintf(buf, 5, "%4d", cm); // right-aligned in 4 chars
+    lcd_moveto(1, COL_REMOTE);
+    lcd_stringout(buf);
 }
 
 // send a 10us trigger pulse to start a rangefinder measurement
@@ -394,6 +546,93 @@ ISR(TIMER1_COMPA_vect)
     }
 }
 
+// timer0 isr - fires every half-period of the current tone
+// while count > 0: toggle pb5 to make the square thing that creates the sound
+// when count reaches 0: load the next note's values, or stop if all 3 notes are done
+ISR(TIMER0_COMPA_vect)
+{
+    if (buzz_count > 0)
+    {
+        PORTB ^= (1 << PB5); // toggle buzzer pin (this is what makes the sound)
+        buzz_count--;
+    }
+    else
+    {
+        // current note is done - move to next note in the sequence
+        buzz_idx++;
+        if (buzz_idx < 3)
+        {
+            // load the next note's pitch and duration from the arrays
+            OCR0A = buzz_ocr[buzz_idx];
+            buzz_count = buzz_cnt[buzz_idx];
+            TCNT0 = 0;
+            // timer is still running - no need to restart it
+        }
+        else
+        {
+            // all 3 notes finished - shut everything down
+            TCCR0B = 0;           // stop timer0 (no more interrupts)
+            PORTB &= ~(1 << PB5); // leave buzzer pin low (silent)
+        }
+    }
+}
+
+// usart receive-complete isr - fires every time one byte arrives on rx
+// implements the @<optional minus><1-4 digits>$ protocol from the spec.
+// on ANY error (missing @, garbage chars, overflow, missing $) we just reset
+// rx_started and wait for the next '@'
+ISR(USART_RX_vect)
+{
+    char c = UDR0; // reading udr0 also clears the rxc0 (rx complete) flag
+
+    if (c == '@')
+    {
+        // start of a new packet.. even if the previus one was incomplete,
+        // we abandon it here and start fresh. this is our recovery mechanism
+        // for partially-transmitted or garbled packets
+        rx_started = 1;
+        rx_count = 0;
+        rx_valid = 0;
+    }
+
+    else if (rx_started)
+    {
+        if (c == '$')
+        {
+            // end-of-packet marker. only valid if at least one digit arrived
+            // (spec: "if there is no threshold data thwn the flag should not be set")
+            if (rx_count > 0)
+            {
+                rx_buf[rx_count] = '\0'; // null-terminate so sscanf can parse
+                rx_valid = 1;            // signal main loop: data ready
+            }
+            rx_started = 0; // either way, packet is done
+        }
+        else if (c == '-' || (c >= '0' && c <= '9'))
+        {
+            // valid character so store it if there's room
+            // buffer is 6 bytes, max payload is 5 chars (-9999) + null,
+            // so rx_count = 0..4 is ok. count == 5 mesns overflow!!!
+            if (rx_count < 5)
+            {
+                rx_buf[rx_count] = c;
+                rx_count++;
+            }
+            else
+            {
+                // overflow: toss thi bad boy
+                rx_started = 0;
+            }
+        }
+        else
+        {
+            // garbage character mid-packet so discard everything we have
+            rx_started = 0;
+        }
+    }
+    // if rx_started is 0 and c isn't '@', we just ignore the byte
+}
+
 // main
 int main(void)
 {
@@ -406,7 +645,8 @@ int main(void)
     DDRD &= ~(1 << PD2); // echo    = input
 
     // initial output states
-    PORTB |= (1 << PB4);              // tri-state buffer disabled
+    PORTB &= ~(1 << PB4);             // drive pb4 low to enable the rx tri-state buffer (during programming pb4 floats high via pull-up,
+                                      // which disables the buffer)
     PORTB &= ~(1 << PB5);             // buzzer off
     PORTD &= ~(1 << PD3);             // trigger idle-low
     PORTC |= (1 << PC4) | (1 << PC5); // encoder pull-ups on
@@ -417,6 +657,8 @@ int main(void)
     adc_init();
     timer2_init();
     timer1_setup_pulse(); // TIMER1 ready for first echo measurement
+    usart_init();
+    timer0_init(); // configure timer0 for buzzer (stays stopped until a tone plays)
 
     // splash screen
     lcd_writecommand(1);
@@ -468,6 +710,10 @@ int main(void)
 
     sei();
 
+    // TEMPORARY DEBUG play startup tone to verify buzzer works
+    play_ascending();
+    _delay_ms(1500); // wait long enough for the 3-note sequence to finish
+
     // main loop
     while (1)
     {
@@ -481,6 +727,32 @@ int main(void)
             update_led();
         }
 
+        // remote speed packet received? parse it and update lcd
+        if (rx_valid)
+        {
+            rx_valid = 0; // clear flag FIRST so a packet arriving during sscanf doesn't get its rx_valid=1 fucked by us setting it to 0
+
+            int16_t parsed;
+            // %hd = 16-bit signed int (matches int16_t). cast away volatile because
+            // we know the isr won't touch rx_buf again until the next '@' arrives.
+            if (sscanf((char *)rx_buf, "%hd", &parsed) == 1)
+            {
+                remote_mm_sec = parsed;
+                remote_valid = 1;
+                show_remote_speed(remote_mm_sec);
+
+                // pick which sequence to play based on |remote speed| vs threshold.
+                // remote_mm_sec is in mm/sec, threshold is in cm/sec, so multiply threshold by 10.
+                // only the magnitude matters - direction (positive vs negative) is ignored.
+                uint16_t remote_mag = (remote_mm_sec < 0) ? (uint16_t)(-remote_mm_sec)
+                                                          : (uint16_t)(remote_mm_sec);
+                if (remote_mag > (uint16_t)threshold * 10)
+                    play_ascending(); // remote is faster than threshold
+                else
+                    play_descending(); // remote is at or below threshold
+            }
+        }
+
         // stopwatch timeout: 10s elapsed with no second measurement
         if (stopwatch_timeout)
         {
@@ -488,17 +760,18 @@ int main(void)
             state = STATE_IDLE;
             speed_valid = 0;
             update_led(); // back to blue
-            OCR2A = 12;   // servo back to start
+            OCR2A = 35;   // servo back to start
             lcd_moveto(0, COL_TIME);
             lcd_stringout("    "); // clear elapsed time
         }
 
-        // update elapsed time display and (eventually) servo dial while stopwatch is running
+        // update elapsed time display and servo dial while stopwatch is running
         if (state == STATE_TIMING && time_changed)
         {
             time_changed = 0;
             show_elapsed();
-            // OCR2A = 35 - elapsed_tenths * 23 / 100
+            // OCR2A = 35 - (elapsed_tenths * 23) / 100
+            // fuck it overflows if we multiply by 23, fix (cast)
             OCR2A = (uint8_t)(35 - (uint16_t)elapsed_tenths * 23 / 100);
         }
 
@@ -585,6 +858,8 @@ int main(void)
                 speed_valid = 1;
                 show_speed();
                 update_led();
+                // send speed to remote board
+                send_speed(speed_mm_sec); // transmit our speed in mm/sec to the remote board
             }
             else
             {
@@ -595,7 +870,7 @@ int main(void)
                 update_led();
             }
 
-            OCR2A = 12; // servo back to start position
+            OCR2A = 35; // servo back to start position
             state = STATE_IDLE;
             _delay_ms(200); // debounce
         }
